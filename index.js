@@ -1,4 +1,5 @@
 import express from "express";
+import { randomUUID } from "crypto";
 
 const app = express();
 app.use(express.json());
@@ -6,12 +7,13 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const POLLINATIONS_API_KEY = process.env.POLLINATIONS_API_KEY || "";
 
-// Simple health check so you can confirm the server is alive in a browser
+// Track sessions (in-memory; fine for a single Render instance)
+const sessions = new Set();
+
 app.get("/", (req, res) => {
   res.send("Pollinations MCP server is running. MCP endpoint is /mcp");
 });
 
-// Describe the one tool this server exposes: generate_image
 const TOOLS = [
   {
     name: "generate_image",
@@ -44,7 +46,8 @@ const TOOLS = [
 
 async function generateImage({ prompt, width = 1024, height = 1024, seed }) {
   const encodedPrompt = encodeURIComponent(prompt);
-  let url = `https://gen.pollinations.ai/image/${encodedPrompt}?width=${width}&height=${height}&nologo=true`;
+  // FIX: correct Pollinations domain + path is image.pollinations.ai/prompt/...
+  let url = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=${width}&height=${height}&nologo=true`;
   if (seed !== undefined) url += `&seed=${seed}`;
 
   const headers = {};
@@ -52,13 +55,17 @@ async function generateImage({ prompt, width = 1024, height = 1024, seed }) {
     headers["Authorization"] = `Bearer ${POLLINATIONS_API_KEY}`;
   }
 
+  console.log(`[generate_image] fetching: ${url}`);
   const response = await fetch(url, { headers });
+  console.log(`[generate_image] status: ${response.status}`);
+
   if (!response.ok) {
-    throw new Error(`Pollinations API error: ${response.status} ${response.statusText}`);
+    const bodyText = await response.text().catch(() => "");
+    throw new Error(
+      `Pollinations API error: ${response.status} ${response.statusText} ${bodyText.slice(0, 200)}`
+    );
   }
 
-  // The image bytes come back directly; we re-expose the same URL as the result
-  // (Claude can fetch this URL to display/download the image)
   return {
     content: [
       {
@@ -69,36 +76,58 @@ async function generateImage({ prompt, width = 1024, height = 1024, seed }) {
   };
 }
 
-// Main MCP JSON-RPC endpoint
 app.post("/mcp", async (req, res) => {
-  const { jsonrpc, id, method, params } = req.body;
+  // Log every incoming request so Render logs show request-time activity
+  console.log(`[mcp] method=${req.body?.method} session=${req.headers["mcp-session-id"] || "none"}`);
+
+  // Always respond as JSON (not SSE) — simplest transport Claude's client accepts
+  res.setHeader("Content-Type", "application/json");
+
+  const { id, method, params } = req.body || {};
 
   try {
     if (method === "initialize") {
+      const sessionId = randomUUID();
+      sessions.add(sessionId);
+      res.setHeader("Mcp-Session-Id", sessionId);
       return res.json({
         jsonrpc: "2.0",
         id,
         result: {
           protocolVersion: "2025-06-18",
           capabilities: { tools: {} },
-          serverInfo: { name: "pollinations-mcp-server", version: "1.0.0" },
+          serverInfo: { name: "pollinations-mcp-server", version: "1.0.1" },
         },
       });
     }
 
+    if (method === "notifications/initialized") {
+      return res.status(202).end();
+    }
+
     if (method === "tools/list") {
-      return res.json({
-        jsonrpc: "2.0",
-        id,
-        result: { tools: TOOLS },
-      });
+      return res.json({ jsonrpc: "2.0", id, result: { tools: TOOLS } });
     }
 
     if (method === "tools/call") {
-      const { name, arguments: args } = params;
+      const { name, arguments: args } = params || {};
       if (name === "generate_image") {
-        const result = await generateImage(args);
-        return res.json({ jsonrpc: "2.0", id, result });
+        try {
+          const result = await generateImage(args || {});
+          return res.json({ jsonrpc: "2.0", id, result });
+        } catch (err) {
+          console.error(`[generate_image] failed: ${err.message}`);
+          // Return as a TOOL result error (isError), not a JSON-RPC error.
+          // This is what lets Claude show the actual failure reason instead of a generic one.
+          return res.json({
+            jsonrpc: "2.0",
+            id,
+            result: {
+              content: [{ type: "text", text: `Image generation failed: ${err.message}` }],
+              isError: true,
+            },
+          });
+        }
       }
       return res.json({
         jsonrpc: "2.0",
@@ -107,18 +136,14 @@ app.post("/mcp", async (req, res) => {
       });
     }
 
-    // Notifications (no id expected) - just acknowledge
-    if (method === "notifications/initialized") {
-      return res.status(202).end();
-    }
-
     return res.json({
       jsonrpc: "2.0",
       id,
       error: { code: -32601, message: `Unknown method: ${method}` },
     });
   } catch (err) {
-    return res.json({
+    console.error(`[mcp] unhandled error: ${err.stack || err.message}`);
+    return res.status(200).json({
       jsonrpc: "2.0",
       id,
       error: { code: -32000, message: err.message },
